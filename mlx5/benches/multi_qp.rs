@@ -1,7 +1,7 @@
 //! Multi-QP pingpong throughput benchmark.
 //!
-//! Compares RC (512 QPs), UD (1 QP), and DC (1 DCI) for 512 concurrent
-//! connections with queue depth 1 each. Server: 16 threads, Client: 1 thread.
+//! Compares RC (507 QPs), UD (1 QP), and DC (1 DCI) for 507 concurrent
+//! connections with queue depth 1 each. Server: 13 threads, Client: 1 thread.
 //!
 //! Optimizations applied:
 //! - 1/8 signaling ratio (reduce CQ pressure)
@@ -53,17 +53,17 @@ fn pin_to_core(core_id: usize) {
 // Constants
 // =============================================================================
 
-const NUM_CONNECTIONS: usize = 512;
 const NUM_SERVER_THREADS: usize = 13;
-const QPS_PER_THREAD: usize = NUM_CONNECTIONS / NUM_SERVER_THREADS; // 39
+const QPS_PER_THREAD: usize = 39;
+const NUM_CONNECTIONS: usize = NUM_SERVER_THREADS * QPS_PER_THREAD; // 507
 const SMALL_MSG_SIZE: usize = 32;
 const RECV_BUF_ENTRY_SIZE: usize = 64;
 const UD_RECV_ENTRY_SIZE: usize = 128;
 const DC_KEY: u64 = 0x1234_5678_ABCD_EF00;
 const SIGNAL_INTERVAL: usize = 8;
 
-// RC QP depth: needs headroom for signaling interval
-const RC_MAX_SEND_WR: u32 = 16;
+// RC QP depth: SQ needs headroom for 1/8 signaling across repeated criterion invocations.
+const RC_MAX_SEND_WR: u32 = 128;
 const RC_MAX_RECV_WR: u32 = 16;
 
 // =============================================================================
@@ -133,17 +133,20 @@ impl Drop for MultiServerHandle {
 #[derive(Clone)]
 struct ClientRecvState {
     rx_count: Rc<Cell<usize>>,
+    completed_qps: Rc<RefCell<Vec<usize>>>,
 }
 
 impl ClientRecvState {
     fn new() -> Self {
         Self {
             rx_count: Rc::new(Cell::new(0)),
+            completed_qps: Rc::new(RefCell::new(Vec::with_capacity(NUM_CONNECTIONS))),
         }
     }
 
     fn reset(&self) {
         self.rx_count.set(0);
+        self.completed_qps.borrow_mut().clear();
     }
 }
 
@@ -306,6 +309,10 @@ fn rc_server_thread_main(
     let mut send_count = 0usize;
 
     while !stop_flag.load(Ordering::Relaxed) {
+        // Always drain send CQEs to prevent SQ accumulation between invocations
+        send_cq.poll(|_, _| {});
+        send_cq.flush();
+
         let recv_state_ref = recv_state.clone();
         recv_cq.poll(|cqe, entry| {
             if cqe.opcode.is_responder() && cqe.syndrome == 0 {
@@ -317,9 +324,6 @@ fn rc_server_thread_main(
         if received.is_empty() {
             continue;
         }
-
-        send_cq.poll(|_, _| {});
-        send_cq.flush();
 
         // Phase 1: Repost all recvs
         for &qp_idx in &received {
@@ -347,22 +351,24 @@ fn rc_server_thread_main(
             let qp = qps[idx].borrow();
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
             if send_count % SIGNAL_INTERVAL == SIGNAL_INTERVAL - 1 {
-                let _ = emit_wqe!(
+                emit_wqe!(
                     &ctx,
                     send {
                         flags: WqeFlags::empty(),
                         inline: echo_data.as_slice(),
                         signaled: idx as u64,
                     }
-                );
+                )
+                .expect("server SQ full");
             } else {
-                let _ = emit_wqe!(
+                emit_wqe!(
                     &ctx,
                     send {
                         flags: WqeFlags::empty(),
                         inline: echo_data.as_slice(),
                     }
-                );
+                )
+                .expect("server SQ full");
             }
             send_count += 1;
         }
@@ -518,28 +524,34 @@ fn run_rc_multi_qp_throughput(setup: &RcMultiQpSetup, iters: u64) -> Duration {
     let total = iters as usize * NUM_CONNECTIONS;
     let signal_interval = SIGNAL_INTERVAL.min(total).max(1);
 
+    // Drain residual send CQEs from previous invocation
+    setup.send_cq.poll(|_, _| {});
+    setup.send_cq.flush();
+
     // Initial fill: post 1 send per QP with 1/8 signaling
     let mut send_count = 0usize;
     for i in 0..NUM_CONNECTIONS {
         let qp = setup.qps[i].borrow();
         let ctx = qp.emit_ctx().expect("emit_ctx failed");
         if send_count % signal_interval == signal_interval - 1 {
-            let _ = emit_wqe!(
+            emit_wqe!(
                 &ctx,
                 send {
                     flags: WqeFlags::empty(),
                     inline: send_data.as_slice(),
                     signaled: i as u64,
                 }
-            );
+            )
+            .expect("client SQ full in initial fill");
         } else {
-            let _ = emit_wqe!(
+            emit_wqe!(
                 &ctx,
                 send {
                     flags: WqeFlags::empty(),
                     inline: send_data.as_slice(),
                 }
-            );
+            )
+            .expect("client SQ full in initial fill");
         }
         qp.ring_sq_doorbell();
         send_count += 1;
@@ -548,16 +560,19 @@ fn run_rc_multi_qp_throughput(setup: &RcMultiQpSetup, iters: u64) -> Duration {
     let start = std::time::Instant::now();
     let mut completed = 0usize;
     let mut sent = NUM_CONNECTIONS; // already sent initial fill
-    let mut recv_idx = 0usize;
 
     while completed < total {
         setup.client_state.reset();
         let client_state_ref = setup.client_state.clone();
-        setup.recv_cq.poll(|cqe, _entry| {
+        setup.recv_cq.poll(|cqe, entry| {
             if cqe.opcode.is_responder() && cqe.syndrome == 0 {
                 client_state_ref
                     .rx_count
                     .set(client_state_ref.rx_count.get() + 1);
+                client_state_ref
+                    .completed_qps
+                    .borrow_mut()
+                    .push(entry as usize);
             }
         });
         setup.recv_cq.flush();
@@ -572,9 +587,8 @@ fn run_rc_multi_qp_throughput(setup: &RcMultiQpSetup, iters: u64) -> Duration {
         setup.send_cq.poll(|_, _| {});
         setup.send_cq.flush();
 
-        // Repost recv WQEs (round-robin across QPs)
-        for _ in 0..rx_count {
-            let idx = recv_idx % NUM_CONNECTIONS;
+        // Repost recv WQEs to the QPs that actually completed
+        for &idx in setup.client_state.completed_qps.borrow().iter() {
             let offset = (idx * RECV_BUF_ENTRY_SIZE) as u64;
             let qp = setup.qps[idx].borrow();
             qp.post_recv(
@@ -585,7 +599,6 @@ fn run_rc_multi_qp_throughput(setup: &RcMultiQpSetup, iters: u64) -> Duration {
             )
             .unwrap();
             qp.ring_rq_doorbell();
-            recv_idx += 1;
         }
 
         // Post new sends if needed (1 per completed, round-robin)
@@ -595,22 +608,24 @@ fn run_rc_multi_qp_throughput(setup: &RcMultiQpSetup, iters: u64) -> Duration {
             let qp = setup.qps[qp_idx].borrow();
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
             if send_count % signal_interval == signal_interval - 1 {
-                let _ = emit_wqe!(
+                emit_wqe!(
                     &ctx,
                     send {
                         flags: WqeFlags::empty(),
                         inline: send_data.as_slice(),
                         signaled: qp_idx as u64,
                     }
-                );
+                )
+                .expect("client SQ full in loop");
             } else {
-                let _ = emit_wqe!(
+                emit_wqe!(
                     &ctx,
                     send {
                         flags: WqeFlags::empty(),
                         inline: send_data.as_slice(),
                     }
-                );
+                )
+                .expect("client SQ full in loop");
             }
             qp.ring_sq_doorbell();
             send_count += 1;
@@ -662,14 +677,18 @@ fn ud_server_thread_main(
 
     let recv_count = Rc::new(Cell::new(0usize));
 
+    // Use larger queue depth than QPS_PER_THREAD to absorb send bursts
+    // (UD is unreliable; packets are dropped if RQ is empty)
+    let server_queue_depth = NUM_CONNECTIONS;
+
     let send_cq = match ctx
-        .create_mono_cq::<UdQpForMonoCq<u64>>(QPS_PER_THREAD as i32, &CqConfig::default())
+        .create_mono_cq::<UdQpForMonoCq<u64>>(server_queue_depth as i32, &CqConfig::default())
     {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
     let recv_cq = match ctx
-        .create_mono_cq::<UdQpForMonoCq<u64>>(QPS_PER_THREAD as i32, &CqConfig::default())
+        .create_mono_cq::<UdQpForMonoCq<u64>>(server_queue_depth as i32, &CqConfig::default())
     {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
@@ -677,8 +696,8 @@ fn ud_server_thread_main(
 
     let qkey = 0x11111111u32;
     let ud_config = UdQpConfig {
-        max_send_wr: QPS_PER_THREAD as u32,
-        max_recv_wr: QPS_PER_THREAD as u32,
+        max_send_wr: server_queue_depth as u32,
+        max_recv_wr: server_queue_depth as u32,
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 256,
@@ -699,7 +718,7 @@ fn ud_server_thread_main(
         return;
     }
 
-    let recv_buf = AlignedBuffer::new(QPS_PER_THREAD * UD_RECV_ENTRY_SIZE);
+    let recv_buf = AlignedBuffer::new(server_queue_depth * UD_RECV_ENTRY_SIZE);
     let recv_mr = match unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) } {
         Ok(mr) => mr,
         Err(_) => return,
@@ -720,7 +739,7 @@ fn ud_server_thread_main(
     };
 
     // Pre-post recv WQEs
-    for i in 0..QPS_PER_THREAD {
+    for i in 0..server_queue_depth {
         let offset = (i * UD_RECV_ENTRY_SIZE) as u64;
         qp.borrow()
             .post_recv(
@@ -761,7 +780,7 @@ fn ud_server_thread_main(
         {
             let qp_ref = qp.borrow();
             for _ in 0..count {
-                let idx = recv_idx % QPS_PER_THREAD;
+                let idx = recv_idx % server_queue_depth;
                 let offset = (idx * UD_RECV_ENTRY_SIZE) as u64;
                 qp_ref
                     .post_recv(
@@ -1111,20 +1130,23 @@ fn dc_server_thread_main(
         Err(_) => return,
     });
 
+    // Use larger queue depth to absorb send bursts
+    let server_queue_depth = NUM_CONNECTIONS;
+
     let send_cq = match ctx
-        .create_mono_cq::<DciForMonoCq<u64>>(QPS_PER_THREAD as i32, &CqConfig::default())
+        .create_mono_cq::<DciForMonoCq<u64>>(server_queue_depth as i32, &CqConfig::default())
     {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
-    let recv_cq = match ctx.create_cq(QPS_PER_THREAD as i32, &CqConfig::default()) {
+    let recv_cq = match ctx.create_cq(server_queue_depth as i32, &CqConfig::default()) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
 
     // Create SRQ for DCT
     let srq_config = SrqConfig {
-        max_wr: QPS_PER_THREAD as u32,
+        max_wr: server_queue_depth as u32,
         max_sge: 1,
     };
     let srq = match pd.create_srq::<u64>(&srq_config) {
@@ -1150,7 +1172,7 @@ fn dc_server_thread_main(
 
     // Create DCI for echo (MonoCq)
     let dci_config = DciConfig {
-        max_send_wr: QPS_PER_THREAD as u32,
+        max_send_wr: server_queue_depth as u32,
         max_send_sge: 1,
         max_inline_data: 256,
     };
@@ -1167,7 +1189,7 @@ fn dc_server_thread_main(
         return;
     }
 
-    let recv_buf = AlignedBuffer::new(QPS_PER_THREAD * RECV_BUF_ENTRY_SIZE);
+    let recv_buf = AlignedBuffer::new(server_queue_depth * RECV_BUF_ENTRY_SIZE);
     let recv_mr = match unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) } {
         Ok(mr) => mr,
         Err(_) => return,
@@ -1188,7 +1210,7 @@ fn dc_server_thread_main(
     };
 
     // Pre-post recv WQEs on SRQ
-    for i in 0..QPS_PER_THREAD {
+    for i in 0..server_queue_depth {
         let offset = (i * RECV_BUF_ENTRY_SIZE) as u64;
         srq.post_recv(
             i as u64,
@@ -1228,7 +1250,7 @@ fn dc_server_thread_main(
 
         // Repost recv on SRQ
         for _ in 0..count {
-            let idx = recv_idx % QPS_PER_THREAD;
+            let idx = recv_idx % server_queue_depth;
             let offset = (idx * RECV_BUF_ENTRY_SIZE) as u64;
             srq.post_recv(
                 idx as u64,
@@ -1543,7 +1565,7 @@ fn bench_rc_512qp(c: &mut Criterion) {
 
     pin_to_core(15);
 
-    let mut group = c.benchmark_group("multi_qp_512");
+    let mut group = c.benchmark_group("multi_qp");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
     group.throughput(Throughput::Elements(NUM_CONNECTIONS as u64));
@@ -1566,7 +1588,7 @@ fn bench_ud_512qp(c: &mut Criterion) {
 
     pin_to_core(15);
 
-    let mut group = c.benchmark_group("multi_qp_512");
+    let mut group = c.benchmark_group("multi_qp");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
     group.throughput(Throughput::Elements(NUM_CONNECTIONS as u64));
@@ -1589,7 +1611,7 @@ fn bench_dc_512qp(c: &mut Criterion) {
 
     pin_to_core(15);
 
-    let mut group = c.benchmark_group("multi_qp_512");
+    let mut group = c.benchmark_group("multi_qp");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
     group.throughput(Throughput::Elements(NUM_CONNECTIONS as u64));
