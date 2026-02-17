@@ -3573,7 +3573,7 @@ fn test_dc_bidirectional_stress() {
             .create_endpoint(&ep_config)
             .expect("Server: Failed to create endpoint");
 
-        let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
+        let (info, lid, _) = ep.local_info(&ctx);
         server_info_tx
             .send(DcConnectionInfo {
                 dct_number: info.dct_number,
@@ -3685,7 +3685,7 @@ fn test_dc_bidirectional_stress() {
         .create_endpoint(&ep_config)
         .expect("Client: Failed to create endpoint");
 
-    let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
+    let (info, lid, _) = ep.local_info(&ctx);
     client_info_tx
         .send(DcConnectionInfo {
             dct_number: info.dct_number,
@@ -3850,7 +3850,7 @@ fn test_dc_bidirectional_tiny_ring() {
             recv_ring_size: RING_SIZE,
         };
         let mut ep = ctx.create_endpoint(&ep_config).expect("Server ep");
-        let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
+        let (info, lid, _) = ep.local_info(&ctx);
         server_info_tx
             .send(DcConnectionInfo {
                 dct_number: info.dct_number,
@@ -3948,7 +3948,7 @@ fn test_dc_bidirectional_tiny_ring() {
         recv_ring_size: RING_SIZE,
     };
     let mut ep = ctx.create_endpoint(&ep_config).expect("Client ep");
-    let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
+    let (info, lid, _) = ep.local_info(&ctx);
     client_info_tx
         .send(DcConnectionInfo {
             dct_number: info.dct_number,

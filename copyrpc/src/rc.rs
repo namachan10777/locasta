@@ -210,8 +210,8 @@ pub struct Context<U> {
     send_cqe_buffer: Rc<SendCqeBuffer>,
     /// Registered endpoints by QPN.
     endpoints: UnsafeCell<FastMap<Rc<UnsafeCell<EndpointInner<U>>>>>,
-    /// Endpoints that have pending send work.
-    dirty_endpoints: UnsafeCell<VecDeque<Rc<UnsafeCell<EndpointInner<U>>>>>,
+    /// Endpoints that have pending send work (shared with Endpoint handles).
+    dirty_endpoints: Rc<UnsafeCell<VecDeque<Rc<UnsafeCell<EndpointInner<U>>>>>>,
     /// Port number (for connection establishment).
     port: u8,
     /// Local LID.
@@ -317,7 +317,7 @@ impl<U> ContextBuilder<U> {
             recv_cq,
             send_cqe_buffer,
             endpoints: UnsafeCell::new(FastMap::new()),
-            dirty_endpoints: UnsafeCell::new(VecDeque::new()),
+            dirty_endpoints: Rc::new(UnsafeCell::new(VecDeque::new())),
             port: self.port,
             lid,
             recv_stack: UnsafeCell::new(Vec::new()),
@@ -375,7 +375,7 @@ impl<U> Context<U> {
 
         Ok(Endpoint {
             inner,
-            ctx: self as *const Context<U>,
+            dirty_queue: self.dirty_endpoints.clone(),
             _marker: PhantomData,
         })
     }
@@ -519,7 +519,7 @@ impl<U> Context<U> {
                 break;
             };
             let ep_ref = unsafe { &*ep.get() };
-            if ep_ref.flush().is_err() {
+            if let Err(_e) = ep_ref.flush() {
                 ep_ref.is_dirty.set(false);
                 continue;
             }
@@ -1176,11 +1176,22 @@ pub struct LocalEndpointInfo {
 /// An RPC endpoint representing a connection to a remote peer.
 pub struct Endpoint<U> {
     inner: Rc<UnsafeCell<EndpointInner<U>>>,
-    ctx: *const Context<U>,
+    dirty_queue: Rc<UnsafeCell<VecDeque<Rc<UnsafeCell<EndpointInner<U>>>>>>,
     _marker: PhantomData<U>,
 }
 
 impl<U> Endpoint<U> {
+    /// Mark this endpoint as dirty (has pending send data).
+    #[inline(always)]
+    fn mark_dirty(&self) {
+        let ep_ref = unsafe { &*self.inner.get() };
+        if ep_ref.is_dirty.get() {
+            return;
+        }
+        ep_ref.is_dirty.set(true);
+        unsafe { &mut *self.dirty_queue.get() }.push_back(self.inner.clone());
+    }
+
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { &*self.inner.get() }.qpn()
@@ -1434,7 +1445,7 @@ impl<U> Endpoint<U> {
         inner
             .batch_message_count
             .set(inner.batch_message_count.get() + 1);
-        unsafe { &*self.ctx }.mark_endpoint_dirty(&self.inner);
+        self.mark_dirty();
 
         // Deduct credit
         inner

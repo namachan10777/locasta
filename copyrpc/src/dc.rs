@@ -208,7 +208,7 @@ pub struct Context<U> {
     dci: Rc<RefCell<DciQp>>,
     dct: Dct<SrqEntry>,
     endpoints: UnsafeCell<FastMap<Box<UnsafeCell<EndpointInner<U>>>>>,
-    dirty_endpoints: UnsafeCell<DirtyEndpointList>,
+    dirty_endpoints: Rc<UnsafeCell<DirtyEndpointList>>,
     pending_send_cqes: Cell<u32>,
     recv_stack: UnsafeCell<Vec<RecvMessage<U>>>,
     next_endpoint_id: Cell<u32>,
@@ -336,7 +336,7 @@ impl<U> ContextBuilder<U> {
             dci,
             dct,
             endpoints: UnsafeCell::new(FastMap::new()),
-            dirty_endpoints: UnsafeCell::new(DirtyEndpointList::new()),
+            dirty_endpoints: Rc::new(UnsafeCell::new(DirtyEndpointList::new())),
             pending_send_cqes: Cell::new(0),
             recv_stack: UnsafeCell::new(Vec::new()),
             next_endpoint_id: Cell::new(1),
@@ -379,7 +379,7 @@ impl<U> Context<U> {
 
         Ok(Endpoint {
             inner: inner_ptr,
-            ctx: self as *const Context<U>,
+            dirty_queue: self.dirty_endpoints.clone(),
             _marker: PhantomData,
         })
     }
@@ -950,19 +950,24 @@ impl<U> EndpointInner<U> {
 
 pub struct Endpoint<U> {
     inner: *const UnsafeCell<EndpointInner<U>>,
-    ctx: *const Context<U>,
+    dirty_queue: Rc<UnsafeCell<DirtyEndpointList>>,
     _marker: PhantomData<U>,
 }
 
 impl<U> Endpoint<U> {
+    /// Mark this endpoint as dirty (has pending send data).
+    #[inline(always)]
+    fn mark_dirty(&self, endpoint_id: u32) {
+        unsafe { &mut *self.dirty_queue.get() }.push_back(endpoint_id);
+    }
+
     pub fn endpoint_id(&self) -> u32 {
         unsafe { &*(*self.inner).get() }.endpoint_id
     }
 
-    pub fn local_info(&self, ctx_lid: u16, _ctx_port: u8) -> (LocalEndpointInfo, u16, u8) {
-        let ctx = unsafe { &*self.ctx };
-        let info = unsafe { &*(*self.inner).get() }.local_info(&ctx.dct, ctx_lid);
-        (info, ctx_lid, ctx.port)
+    pub fn local_info(&self, ctx: &Context<U>) -> (LocalEndpointInfo, u16, u8) {
+        let info = unsafe { &*(*self.inner).get() }.local_info(&ctx.dct, ctx.lid());
+        (info, ctx.lid(), ctx.port)
     }
 
     pub fn connect(
@@ -1000,7 +1005,6 @@ impl<U> Endpoint<U> {
         _response_allowance: u64,
     ) -> std::result::Result<u32, error::CallError<U>> {
         let inner = unsafe { &*(*self.inner).get() };
-        let ctx = unsafe { &*self.ctx };
 
         let remote_ring = inner
             .remote_recv_ring
@@ -1011,7 +1015,7 @@ impl<U> Endpoint<U> {
 
         if !inner.has_cycle_room_for(msg_size) {
             inner.wrap_pending.set(true);
-            ctx.mark_endpoint_dirty(inner.endpoint_id);
+            self.mark_dirty(inner.endpoint_id);
             return Err(error::CallError::RingFull(user_data));
         }
 
@@ -1023,7 +1027,7 @@ impl<U> Endpoint<U> {
             .saturating_sub(in_flight + CREDIT_RETURN_RESERVE);
 
         if available < msg_size {
-            ctx.mark_endpoint_dirty(inner.endpoint_id);
+            self.mark_dirty(inner.endpoint_id);
             return Err(error::CallError::RingFull(user_data));
         }
 
@@ -1041,7 +1045,7 @@ impl<U> Endpoint<U> {
             .batch_message_count
             .set(inner.batch_message_count.get() + 1);
 
-        ctx.mark_endpoint_dirty(inner.endpoint_id);
+        self.mark_dirty(inner.endpoint_id);
 
         Ok(call_id)
     }
