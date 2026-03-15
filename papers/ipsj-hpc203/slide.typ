@@ -1,282 +1,488 @@
-// main.typ — 20min / ~20 slides deck (研究報告用・文字多め)
-// Compile: typst compile main.typ
-#import "@preview/polylux:0.4.0": *
+// slide.typ — 20min / ~20 slides deck (HPC203 LocustaRPC)
+// Compile: typst compile slide.typ
 
-// ---------------- Meta ----------------
-#let conf   = "IPSJ SIG TR 研究報告"
-#let title  = "大規模高速ストレージ向け非同期RPC基盤の設計と評価"
-#let author = "中野 将生, 建部 修見"
-#let affil  = "筑波大学 計算科学研究センター"
-#let date   = datetime.today().display()
+#import "@preview/touying:0.5.5": *
+#import themes.university: *
 
-//#show: slides.with(
-//  theme: theme.light,
-//  aspect: "16:9",
-//  // 研究報告なのでフッタに情報密度を詰める
-//  footer: box(fill: none)[#conf · #date],
-//)
-
-// ------------- Helpers (文字詰め向け) -----------------
-// デフォルト文字サイズをやや小さめに
-#set text(size: 28pt)
-
-// 行間を詰めた箇条書き
-#let dense(..items) = list(
-  items,
-  marker: "・",
-  spacing: 0.25em,
-  indent: 1.2em,
+// テーマ設定
+#show: university-theme.with(
+  aspect-ratio: "16-9",
+  config-info(
+    title: [LocustaRPC: 次世代リーダーシップマシンのための\ スケーラブルなRPC基盤],
+    short-title: [LocustaRPC],
+    subtitle: [IPSJ SIG HPC 203 研究報告],
+    author: [中野 将生, 前田 宗則, 建部 修見],
+    date: [2026年3月],
+    institution: [筑波大学 計算科学研究センター / 富士通株式会社],
+  ),
+  config-page(margin: (top: 2.5em, bottom: 2em, x: 2em)),
+  config-methods(init: (self: none, body) => {
+    set text(font: ("Hiragino Kaku Gothic ProN", "Hiragino Kaku Gothic Pro", "BIZ UDGothic"), lang: "ja", size: 20pt)
+    set par(leading: 0.9em)
+    set list(spacing: 1.2em)
+    set enum(spacing: 1.2em)
+    body
+  }),
 )
 
-// 2段組スライド (左右に詰め込みたいとき用)
-#let twocol(left, right) = grid(
-  columns: (1fr, 1fr),
-  gutter: 1.2em,
-  left,
-  right,
-)
+// ===== タイトルスライド =====
+#title-slide()
 
-// 図用プレースホルダ
-#let graph(path, caption: "") = {
-  column(
-    image(path, width: 100%),
-    if caption != "" { text(size: 20pt, fill: gray)[#caption] }
-  )
-}
+// ===== アジェンダ =====
+== アジェンダ
 
-// セクション見出し用（大きめだが1行）
-#let sec(title) = heading(level: 1)[#title]
-
-// 小見出し
-#let sub(t) = heading(level: 2)[#t]
-
-// ---------------- Slides ----------------
-
-// 1. Title
-slide(
-  layout: "title",
-  title: title,
-  subtitle: conf,
-  authors: author,
-  affiliation: affil,
-  date: date,
-  note: "自己紹介は最小限 (20s)"
-)
-
-// 2. アジェンダ
 #slide[
-  sec("アジェンダ")
-  dense("背景・問題設定", "接続階層化の提案", "RPC 3方式の実装", "評価結果(3グラフ)", "考察・関連研究・今後")
+  + 背景: Fat-node化とad-hoc FS
+  + 問題設定: RDMA接続状態の増大
+  + 提案の要点: ノード内集約とバッチ制御
+  + 設計詳細: 通信プロトコルと制御
+  + 実験: KVSベンチマーク評価
+  + 結論: 効果と制約
 ]
 
-// 3. 背景: HPC/LLMでのI/O集中
+// ===== Part 1: 背景 =====
+
+== 背景: Fat-nodeとプロセス数増大
+
 #slide[
-  sec("背景: HPC/LLMでのI/O集中")
-  dense(
-    "大規模計算(数十~数百PB級FS)でメタ/データI/Oがボトルネック化",
-    "学習/推論ワークロードでは同一チェックポイント/パラメータ群への同時アクセスが発生",
-    "Burst Buffer, ad-hoc FSで一時的吸収は可能だが負荷はホットスポット化しやすい"
-  )
+  - シングルコア性能向上の限界 → マルチコア・アクセラレータへ移行
+  - El Capitan, Frontier, 富岳NEXT: Fat-node構成が主流に
+  - ノード数は減少傾向だが、ノード内プロセス数は増加
+  - 富岳NEXTでは100万オーダーのプロセス数を想定
+
+  #v(0.5em)
+
+  #align(center)[
+    #box(stroke: 0.5pt, inset: 0.6em, radius: 4pt)[
+      ミドルウェアの通信スケーラビリティが設計課題として重要に
+    ]
+  ]
 ]
 
-// 4. 背景: RDMA/RCのスケール課題
-#slide[
-  sec("背景: RDMA RC接続のスケール課題")
-  dense(
-    "Reliable Connection(RC)はQP/CQ/RQ管理コストが接続数に比例",
-    "RNR Retry Exceededなどの安定性問題",
-    "数千〜万規模ノードでは全結合は非現実的"
-  )
-]
+== 背景: ad-hocファイルシステム
 
-// 5. 問題設定
 #slide[
-  sec("問題設定")
-  dense(
-    "(1) ホットチャンク/ノード集中でサーバ側輻輳",
-    "(2) RCの接続数増大でピーク性能が低下",
-    "(3) 既存RPCは" + emph("非対称(多数Client/少数Server)想定") + "で本ケースに不適"
-  )
-]
-
-// 6. 要件・設計方針
-#slide[
-  sec("要件・設計方針")
-  dense(
-    "各ノードの接続数をO(√n)程度に抑制しつつ高帯域・低遅延を維持",
-    "データ/メタデータ整合性は軽量leaseで十分とする",
-    "アプリ側APIは同期I/Oインターフェースを前提 (使いやすさ重視)"
-  )
-]
-
-// 7. 提案: 接続階層化 (√n)
-#slide[
-  sec("提案: 接続階層化(√n)")
-  dense(
-    "全nノードを√n個グループ化し、各グループに中継ノードを配置",
-    "各ノードは: グループ内(≈√n) + 中継(≈√n) + 自身で ≈3√n接続",
-    "グループ内でホットスポットを局在化・分散"
-  )
-  rect(width: 100%, height: 30%, stroke: 1pt + gray)[概念図]
-]
-
-// 8. 一貫性: lease+キャッシュ戦略
-#slide[
-  sec("一貫性/キャッシュ戦略")
-  dense(
-    "IndexFS型lease: 読取多数/書込少数なFSメタデータに適合",
-    "キャッシュ保持期間は短命、無効化はlease失効/更新で管理",
-    "中継ノード経由でメタデータの整合性情報を伝搬"
-  )
-]
-
-// 9. RPC方式の選択肢
-#slide[
-  sec("RPC方式: 3アプローチ")
-  twocol(
+  #grid(
+    columns: (1fr, 1fr),
+    gutter: 1.5em,
     [
-      sub("SEND")
-      dense(
-        "受信RQへ事前ポスト必須",
-        "RNR回避には十分なバッファ数",
-        "完了はCQポーリングで検知"
+      - PFSは専用ノード構成 → 大規模ジョブで相対的性能低下
+      - 突発的I/O集中・小粒度I/Oへの対応が困難
+      - 計算ノード上NVMe/PMを活用するad-hoc FSが発展
+      - CHFS, GekkoFS, BurstFS等
+    ],
+    [
+      #align(center)[
+        #figure(
+          image("handmade-figures/pfs-and-adhocfs.drawio.pdf", width: 100%),
+          caption: [PFS vs ad-hoc FS],
+        )
+      ]
+    ],
+  )
+]
+
+== 問題設定: RDMA接続状態の増大
+
+#slide[
+  #set text(size: 0.95em)
+  - RC: 信頼性・one-sided通信が可能だが接続ごとに状態保持 → cache thrashing
+  - UD: スケーラブルだがSEND/RECVのみ、大容量転送に不向き
+  - DC: NVIDIA独自拡張、RC相当だがNIC cache thrashingは未解決・挙動がやや不安定
+
+  #v(0.5em)
+
+  #align(center)[
+    #box(stroke: 1pt, inset: 0.8em, radius: 4pt, fill: rgb("#f0f0f0"))[
+      *本研究の焦点*: ノード内プロセスの通信をデーモンに集約し、接続状態とメモリ消費を削減
+    ]
+  ]
+]
+
+== 提案の要点
+
+#slide[
+  - *柱1*: ノード外RDMA通信をデーモンに集約し、接続状態を$alpha P$から$D$へ削減
+  - *柱2*: Req/Resをリングバッファにバッチ化し、doorbell/CQ処理の固定コストを償却
+  - *柱3*: 到着分散で崩れるバッチをAdaptive Batch Holdで再形成
+
+  #v(0.7em)
+
+  #align(center)[
+    #box(stroke: 1pt, inset: 0.8em, radius: 4pt, fill: rgb("#f0f0f0"))[
+      ただし集約は通信経路に1-hop追加するため、\
+      接続状態削減の利得がその固定オーバーヘッドを上回るかが評価上の焦点
+    ]
+  ]
+]
+
+// ===== Part 2: 設計 =====
+
+== 設計: ノード内集約アーキテクチャ
+
+#slide[
+  #grid(
+    columns: (1fr, 1fr),
+    gutter: 1.5em,
+    [
+      - ノード外通信の終端をデーモンに集約
+      - アプリプロセスは共有メモリIPCで要求委譲
+      - 要求キュー + 応答スロットで構成
+      - ローカル要求は専用IPCキューで処理（リモート経路と分離）
+      - デーモンはペイロード非解釈、境界管理とWQE発行に専念
+    ],
+    [
+      #figure(
+        image("handmade-figures/in-node-architecture.drawio.pdf", width: 100%),
+        caption: [ノード内アーキテクチャ],
       )
-      sub("WRITE + Immediate")
-      dense(
-        "相手メモリへ直接書込 + 32bit即値で識別",
-        "RQ/CQ必要、実装はSEND近似",
-        "本評価ではSENDとほぼ同性能"
+    ],
+  )
+]
+
+== QP状態メモリの見積り
+
+#slide[
+  - UCX: $M_"conn" = alpha P (N-1)(m_"qp" + m_"ctl")$ ← プロセスごとに接続
+  - 提案: $M_"conn" = D (N-1)(m_"qp" + m_"ctl")$ ← デーモンに集約
+  - 改善率 = $alpha P \/ D$
+
+  #v(0.5em)
+
+  #text(size: 0.85em)[
+    例: N=256, P=64, D=8, $m_"qp"$=16KiB \
+    → UCX ≈ 255MiB vs 提案 ≈ 32MiB（約8倍削減） \
+    → $alpha$=P構成では約512倍削減
+  ]
+
+  #v(0.3em)
+
+  #align(center)[
+    #box(stroke: 0.5pt, inset: 0.5em, radius: 4pt)[
+      NIC接続状態キャッシュ競合の緩和にも寄与
+    ]
+  ]
+]
+
+== RDMA通信プロトコル
+
+#slide[
+  #grid(
+    columns: (1fr, 1fr),
+    gutter: 1.5em,
+    [
+      - 送信リングと受信リングをペアで保持
+      - RDMA WRITE with Immediateでメッセージをバッチ化して送信
+      - 受信側はCQポーリングで到着検知（バッファ走査不要）
+      - 通知コストをバッチ単位に償却
+    ],
+    [
+      // TODO: 送信リング・受信リングのペア構成を示す簡略図を作成してここに挿入
+      #align(center)[
+        #box(width: 100%, height: 60%, stroke: 1pt + gray, radius: 4pt, inset: 1em)[
+          #align(center + horizon)[
+            #text(fill: gray)[（図: 送信リング/受信リングのペア構成）]
+          ]
+        ]
+      ]
+    ],
+  )
+]
+
+== フロー制御
+
+#slide[
+  - 送信バッファ進行位置管理で受信バッファ利用量を同期的に制御
+  - 通常時: Req/Resバッチにflow metadataをpiggyback
+  - デッドロック回避: 送信リング満杯時にRDMA READで対向consumed位置を能動取得
+  - 受信側はResponse滞留中もReq処理を継続 → consumed前進で相互待ち解消
+]
+
+== 送信バッファ書き込み調停
+
+#slide[
+  #grid(
+    columns: (1fr, 1fr),
+    gutter: 1.5em,
+    [
+      === 2段階プロトコル
+      - 複数プロセスが同一バッファへ同時書き込み
+      + fetch\_addでproducer位置を確保
+      + header+payload書込後、stateをReqReadyへ更新
+      - デーモンはReqReady連続区間をWQE化
+      - 競合点を管理情報に限定
+    ],
+    [
+      #figure(
+        image("handmade-figures/message-write.drawio.pdf", width: 100%),
+        caption: [協調書き込みプロトコル],
+      )
+    ],
+  )
+]
+
+== Adaptive Batch Hold制御
+
+#slide[
+  === バッチ崩壊の問題
+  - ノード数増加でリクエスト到着が分散 → 1ループあたり到着数減少
+  - 固定コスト（CQポーリング, IPCチェック）の償却が崩れる
+  - 小バッチ → ループ高速化 → さらに到着少 → 正のフィードバックで性能低下
+
+  #v(0.5em)
+
+  === 対策: Adaptive Batch Hold
+  - 応答返却を短時間保持してバッチ再形成
+  - 到着率から $T_"hold"$ をEWMAで動的推定
+  - 到着ばらけ時は保持長く、集中時は短く → 適応制御
+  // TODO: バッチ崩壊の概念図（正フィードバックループ）があると効果的 → ユーザに作成依頼
+]
+
+// ===== Part 3: 関連研究 =====
+
+== 関連研究
+
+#slide[
+  #set text(size: 0.9em)
+  - *FaRM*: RC維持+thread-to-node粗粒化でQP共有 → スレッド単位
+  - *eRPC*: packet I/O（UD相当）でNIC状態依存を排除 → one-sided不可
+  - *ScaleRPC*: connection grouping+virtualized mapping → ノードレベルQP thrashing残存
+  - *Flock*: RC接続多重化+coalescing → スレッド間共有が主眼
+  - *mRPC*: 共有メモリ+サービス集約 → クラウド向け、接続削減は非主眼
+
+  #v(0.3em)
+
+  #align(center)[
+    #box(stroke: 0.5pt, inset: 0.6em, radius: 4pt)[
+      本研究: ノード内プロセス群をデーモンへ集約 → アーキテクチャレベルで状態量抑制
+    ]
+  ]
+]
+
+// ===== Part 4: 実験 =====
+
+== 実験環境・手法
+
+#slide[
+  #grid(
+    columns: (1fr, 1fr),
+    gutter: 1.5em,
+    [
+      === 環境
+      #align(center)[
+        #table(
+          columns: (auto, 1fr),
+          stroke: 0.5pt,
+          inset: 0.5em,
+          [クラスタ], [Pegasus（筑波大CCS）],
+          [CPU], [Intel Xeon Platinum 8468 (48C)],
+          [NIC], [Mellanox ConnectX-7],
+          [ネットワーク], [InfiniBand],
+          [NUMA], [1ノード構成、コア0-1はIRQ専用],
+        )
+      ]
+    ],
+    [
+      === 手法
+      - ベンチマーク用KVS（rank id+ユーザキー）
+      - YCSB-like read/write混合（50/50）
+      - クライアントプロセス数を変化させ評価
+      - 指標: スループット（MIOPS）
+
+      #v(0.5em)
+
+      #box(stroke: 0.5pt, inset: 0.5em, radius: 4pt, width: 100%)[
+        direct connectionは提案と同一RPC実装で\
+        差分を「ノード内集約の有無」に限定
+      ]
+    ],
+  )
+]
+
+== 比較対象
+
+#slide[
+  #grid(
+    columns: (1fr, 1fr),
+    gutter: 1.5em,
+    [
+      === UCX（ベースライン）
+      - 各クライアントが個別に通信コンテキスト保持
+      - Active Message APIで直接通信
+      - HPCデファクトの通信ライブラリ
+
+      #v(0.5em)
+
+      === direct connection
+      - 提案と同一RPC実装
+      - ノード内集約なし（各プロセスが直接通信）
+      - 集約の有無のみの差分を分離
+    ],
+    [
+      === LocustaRPC（提案）
+      - 共有メモリ経由でデーモンに委譲
+      - デーモンがRDMA通信を集約
+      - ノード外接続数を$D$に抑制
+
+      #v(0.5em)
+
+      #box(stroke: 0.5pt, inset: 0.5em, radius: 4pt, width: 100%)[
+        比較により通信経路（集約の有無）と\
+        RPC実装差を分離して評価
+      ]
+    ],
+  )
+]
+
+== 結果1: 基本性能
+
+#slide[
+  #grid(
+    columns: (1.2fr, 1fr),
+    gutter: 1em,
+    [
+      #figure(
+        image("figures/kvs_benchmark_throughput.pdf", width: 100%),
+        caption: [ノード数 vs 総スループット（MIOPS）],
       )
     ],
     [
-      sub("WRITE + Polling")
-      dense(
-        "受信RQ不要。固定スロット化",
-        "Seq番号をポーリングし到達確認",
-        "RQ補充オーバーヘッド回避 → 低並列で優位"
-      )
-    ]
+      === 結果
+      - 2-4ノード: 提案が優位だが、ローカル要求比率が高い条件
+      - 8ノード: バッチ崩壊で11.2に低下
+      - 16ノード: 19.6に回復するが依然ばらつき大
+      - 32ノード: UCX 66.5 > direct 62.7 > 提案39.2
+    ],
   )
 ]
 
-// 10. 実装概要 (Rustランタイム)
-#slide[
-  sec("実装概要")
-  dense(
-    "Rust製軽量非同期ランタイム: CQポーリング専用スレッド/タスク",
-    "1 QP = 1ユーザスレッド方針 (同期APIを自然に実装)",
-    "固定長スロット/メモリプール化でalloc回避",
-    "RNR Retry Timer=20µsなどNIC設定をチューニング"
-  )
-]
+== 結果2: Adaptive Batch Hold評価
 
-// 11. 実験環境
 #slide[
-  sec("実験環境")
-  twocol(
+  #grid(
+    columns: (1.2fr, 1fr),
+    gutter: 1em,
     [
-      sub("HW")
-      dense(
-        "Server CPU: AMD EPYC 9354P (32C)",
-        "Client CPU: Intel Xeon Gold 6530",
-        "NIC: NVIDIA ConnectX-7 (400GbE/IB)"
+      #figure(
+        image("figures/kvs_benchmark_batch_hold.pdf", width: 100%),
+        caption: [Batch Hold有無の比較],
       )
     ],
     [
-      sub("SW/条件")
-      dense(
-        "OFED 24.x, msg=256B req/resp",
-        "各QP1並列 (多並列はRNRで不安定)",
-        "再送/RNR設定を固定して比較"
+      === 結果
+      - 8ノード: 8.26→11.18（1.35×）
+      - 16ノード: 14.86→19.63（1.32×）
+      - 32ノード: 27.25→39.24（1.44×）
+
+      #v(0.3em)
+
+      #box(stroke: 0.5pt, inset: 0.5em, radius: 4pt)[
+        中大規模でバッチ崩壊は緩和できるが\
+        1-hop追加そのもののコストは残る
+      ]
+    ],
+  )
+]
+
+== 解釈と制約
+
+#slide[
+  - 小規模（2-4ノード）の優位は、ローカル通信で終了する要求が多いことの寄与が大きい
+  - リモート通信では、ノード内委譲→デーモン送信の1-hop追加が固定オーバーヘッドとなる
+  - Adaptive Batch Holdは中大規模のバッチ崩壊を緩和するが、逐次RPCの応答待ち自体は残る
+  - POSIX系ワークロードでは逐次依存が強く、応答待ちのレイテンシを隠しにくい
+  - 32ノードでは追加hopとデーモン並列度の両方が律速となり、UCX/directを下回る
+  - 接続状態メモリ削減の方向性は有効だが、性能改善にはad-hoc FS側の意味論設計も必要
+
+  #v(0.5em)
+
+  #box(stroke: 0.5pt, inset: 0.5em, radius: 4pt, width: 100%)[
+    結論: 単純なRPC集約だけでは不十分で、\
+    応答待ちを減らせるad-hoc FSの意味論設計まで含めた最適化が必要
+  ]
+]
+
+// ===== Part 5: まとめ =====
+
+== まとめ
+
+#slide[
+  === 達成した成果
+  - ノード内共有メモリによる要求委譲+デーモン通信集約のRPC基盤を設計・実装
+  - 接続管理コストを$alpha P$→$D$に削減し、通信資源効率改善の方向性を示した
+  - 小規模での性能優位はローカル要求比率の高さに支えられることを確認
+  - Adaptive Batch Holdで中大規模のバッチ崩壊を最大1.44×緩和
+  - 一方で、POSIX的な逐次RPCでは追加hopのレイテンシ影響が大きい
+
+  #v(0.5em)
+
+  === 今後の課題
+  + 応答待ちなしで次操作を発行可能にするad-hoc FS意味論の再設計
+  + 中継時の1-hop追加コストを抑えるIPC/送信経路の再設計
+  + デーモン並列度の拡張による大規模時の律速緩和
+  + DCを用いたSQ/送受信キュー管理の一本化
+  + 実ad-hocファイルシステム上での大規模評価
+]
+
+== 謝辞
+
+#slide[
+  - JSPS科研費 JP22H00509
+  - NEDO JPNP20017
+  - JST CREST JPMJCR24R4
+  - 筑波大学計算科学研究センター 学際共同利用プログラム
+  - 富士通株式会社 特別共同研究
+]
+
+// ===== 予備スライド =====
+
+== (Backup) RDMAキュー操作
+
+#slide[
+  #grid(
+    columns: (1fr, 1fr),
+    gutter: 1.5em,
+    [
+      - SQ+RQの対 = Queue Pair（QP）
+      - Work Request（WR）→ Work Queue Element（WQE）
+      - 完了通知はCompletion Queue（CQ）に集約
+      - doorbell batching: 複数WQEをまとめて通知
+      - unsignaled CQE: CQ処理負荷の削減
+    ],
+    [
+      #figure(
+        image("handmade-figures/RDMA-SQ-and-RQ.drawio.pdf", width: 100%),
+        caption: [SQ, RQ, QPの関係],
       )
-    ]
+    ],
   )
 ]
 
-// 12. 結果1: スループット
+== (Backup) RDMAトランスポート比較
+
 #slide[
-  sec("結果1: スループット")
-  graph("fig-throughput.pdf", caption: "QP数 vs Mrps")
-  dense(
-    "WRITE+Pollingが4096接続まで最速",
-    "1200接続時でピーク比≈70% (RC劣化は許容範囲)",
-    "64〜128QP付近を境に伸びが鈍化"
-  )
+  - *RC*: 信頼性・順序性・one-sided通信 / 接続ごとに状態保持 → cache thrashing
+  - *UD*: 単一ハンドラで多数通信 / SEND/RECVのみ、MTU制限
+  - *DC*: RC相当+接続数スケール（NVIDIA独自）/ 多数同時通信で性能低下
 ]
 
-// 13. 結果2: レイテンシ分布
-#slide[
-  sec("結果2: レイテンシ")
-  graph("fig-latency.pdf", caption: "p50/p90/p99 レイテンシ")
-  dense(
-    "全方式でQP数に一次近似で増加",
-    "WRITE系は初期立ち上がりが安定 (TLB/バッファ固定効果?)",
-    "Polling方式でも分散は許容範囲"
-  )
-]
-
-// 14. 結果3: CPU/オーバーヘッド
-#slide[
-  sec("結果3: CPU/オーバーヘッド")
-  graph("fig-overhead.pdf", caption: "CPU占有率 / RQ管理コスト")
-  dense(
-    "PollingはCPUポーリング分上昇するが、総オーバーヘッドは低減",
-    "SEND/IMMはRQ補充/取得がボトルネック",
-    "方式ごとのCPU/メモリ使用量トレードオフを確認"
-  )
-]
-
-// 15. 考察
-#slide[
-  sec("考察")
-  dense(
-    "Polling優位: RQ管理除去 & メモリローカリティ改善",
-    "RC劣化は√n階層化で接続数自体を削減し吸収",
-    "同期APIでも十分な性能を得る設計が実用上重要"
-  )
-]
-
-// 16. 関連研究位置付け
-#slide[
-  sec("関連研究")
-  dense(
-    "FaSST/HERD: RDMA WRITE中心のキーバリューストア",
-    "ScaleRPC: 大規模RPCフレームワーク (UD/DC等活用)",
-    "IndexFS: leaseベース整合性; メタデータ分散",
-    "本研究: RC維持+階層化で接続抑制に焦点"
-  )
-]
-
-// 17. まとめ
-#slide[
-  sec("まとめ")
-  dense(
-    "√n階層化により各ノード接続数をO(√n)に削減",
-    "RCでも1200接続でピーク70%性能を確認",
-    "WRITE+Pollingが低並列RPCで最良。SEND/IMMは安定",
-    "今後: マルチスレ化・他FS/ワークロード比較・実運用評価"
-  )
-]
-
-// 18. 謝辞
-#slide[
-  sec("謝辞")
-  text(size: 24pt)[JSPS科研費 JP22H00509 / NEDO JPNP20017 / JST CREST JPMJCR24R4 / CCS共同利用 / 富士通 特別共同研究]
-]
-
-// ---- Backup ----
+== (Backup) Batch Hold改善率詳細
 
 #slide[
-  sec("(Backup) SRQ不採用理由")
-  dense("SRQ利用でRNR Retry Exceeded多発", "管理が複雑化し安定性を損ねる", "専用RQ採用で制御容易化")
-]
+  #align(center)[
+    #table(
+      columns: (auto, auto, auto, auto),
+      stroke: 0.5pt,
+      inset: 0.6em,
+      [ノード数], [no batch hold], [batch hold（10µs）], [改善率],
+      [2],  [13.97], [14.86], [1.06×],
+      [4],  [22.11], [21.10], [0.95×],
+      [8],  [8.26],  [11.18], [1.35×],
+      [16], [14.86], [19.63], [1.32×],
+      [32], [27.25], [39.24], [1.44×],
+    )
+  ]
 
-#slide[
-  sec("(Backup) 代替トランスポート")
-  dense("UD: 接続数問題軽減も信頼性処理が必要", "DC/XRC: QP共有でスケールするが実装複雑", "本研究要件(同期I/O, RC互換)との整合性")
-]
-
-#slide[
-  sec("(Backup) 実装詳細")
-  dense("メモリ登録/固定バッファ割当の流れ", "CQポーリングループ擬似コード", "RNR/Timeout等エラー処理")
+  - 4ノードではわずかに低下 → 到着が十分集中しておりhold不要
+  - 8ノード以上で顕著な改善 → バッチ崩壊緩和の効果
 ]
