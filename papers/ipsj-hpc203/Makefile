@@ -5,9 +5,13 @@ BENCHKV_DATA = result/benchkv/benchkv_unified.parquet
 RPC_BENCH_DATA = result/rpc_bench/rpc_bench_unified.parquet
 FIGURE_PDFS = figures/benchkv_throughput.pdf figures/benchkv_batch_hold.pdf figures/rpc_bench_throughput.pdf
 
-.PHONY: all build docker-build clean watch fix-punctuation
+SLIDE_SRC = slide.typ
+SLIDE_PDF = slide.pdf
+SLIDE_NOTES_PDF = slide-notes.pdf
 
-all: build
+.PHONY: all build docker-build clean watch fix-punctuation slide
+
+all: build slide
 
 # Replace Japanese punctuation (、→，  。→．)
 fix-punctuation:
@@ -29,6 +33,16 @@ build: fix-punctuation $(FIGURE_PDFS) docker-build
 watch: docker-build
 	$(DOCKER_RUN) latexmk -pvc hpc203.tex
 
+# Build slide PDFs (normal + with speaker notes)
+slide: $(SLIDE_PDF) $(SLIDE_NOTES_PDF)
+
+$(SLIDE_PDF): $(SLIDE_SRC) $(FIGURE_PDFS) $(wildcard handmade-figures/*.pdf)
+	typst compile $(SLIDE_SRC) $(SLIDE_PDF)
+
+$(SLIDE_NOTES_PDF): $(SLIDE_SRC) $(FIGURE_PDFS) $(wildcard handmade-figures/*.pdf)
+	typst compile --input notes=true $(SLIDE_SRC) $(SLIDE_NOTES_PDF)
+
 # Clean auxiliary files
 clean:
 	$(DOCKER_RUN) latexmk -C
+	rm -f $(SLIDE_PDF) $(SLIDE_NOTES_PDF)
