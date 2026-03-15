@@ -322,13 +322,6 @@
       - YCSB-like read/write混合（50/50）
       - クライアントプロセス数を変化させ評価
       - 指標: スループット（MIOPS）
-
-      #v(0.5em)
-
-      #box(stroke: 0.5pt, inset: 0.5em, radius: 4pt, width: 100%)[
-        direct connectionは提案と同一RPC実装で\
-        差分を「ノード内集約の有無」に限定
-      ]
     ],
   )
 
@@ -336,6 +329,32 @@
     実験には筑波大学計算科学研究センターのPegasusクラスタを使用しました。
     CPUはIntel Xeon Platinum 8468の48コア、NICはConnectX-7、InfiniBand接続です。
     評価にはベンチマーク用KVSを実装し、YCSB-likeなread/write混合ワークロードで測定しました。
+  ]
+]
+
+== 通信パターン
+
+#slide[
+  #grid(
+    columns: (1fr, 1fr),
+    gutter: 1.5em,
+    [
+      #image("handmade-figures/all-to-all.drawio.png", width: 85%)
+    ],
+    [
+      === all-to-all KVS通信
+      - 各クライアントが全ノードのKVSへGET/PUTを発行
+      - アクセス先はキーのハッシュで決定 → 全ノードに分散
+      - ad-hoc FSの実運用に近いアクセスパターン
+      - direct connectionは提案と同一RPC実装で差分を「集約の有無」に限定
+    ],
+  )
+
+  #speaker-note[
+    通信パターンについて説明します。
+    各クライアントプロセスが全ノードのKVSに対してGETとPUTを発行するall-to-all通信です。
+    アクセス先はキーのハッシュで決定されるため、全ノードに分散します。
+    これはad-hocファイルシステムの実運用に近いアクセスパターンです。
     比較用のdirect connectionは提案と同一のRPC実装を使い、ノード内集約の有無のみを差分としています。
   ]
 ]
