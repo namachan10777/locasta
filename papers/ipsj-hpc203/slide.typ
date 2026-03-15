@@ -28,8 +28,8 @@
 // ===== タイトルスライド =====
 #title-slide()
 
-// ===== アジェンダ =====
-== アジェンダ
+// ===== 目次 =====
+== 目次
 
 #slide[
   + 背景: Fat-node化とad-hoc FS
@@ -45,18 +45,12 @@
 == 背景: Fat-nodeとプロセス数増大
 
 #slide[
-  - シングルコア性能向上の限界 → マルチコア・アクセラレータへ移行
+  - アクセラレータ中心の構成へ移行、ノード内共有メモリの強化が進む
   - El Capitan, Frontier, 富岳NEXT: Fat-node構成が主流に
   - ノード数は減少傾向だが、ノード内プロセス数は増加
   - 富岳NEXTでは100万オーダーのプロセス数を想定
-
-  #v(0.5em)
-
-  #align(center)[
-    #box(stroke: 0.5pt, inset: 0.6em, radius: 4pt)[
-      ミドルウェアの通信スケーラビリティが設計課題として重要に
-    ]
-  ]
+  - ミドルウェアにはプロセス数に対するスケーラビリティが求められる
+  - 処理性能の向上に伴い、よりスケーラブルなI/Oが常に要求される
 ]
 
 == 背景: ad-hocファイルシステム
@@ -102,18 +96,10 @@
 == 提案の要点
 
 #slide[
-  - *柱1*: ノード外RDMA通信をデーモンに集約し、接続状態を$alpha P$から$D$へ削減
-  - *柱2*: Req/Resをリングバッファにバッチ化し、doorbell/CQ処理の固定コストを償却
-  - *柱3*: 到着分散で崩れるバッチをAdaptive Batch Holdで再形成
+  - ノード外RDMA通信をデーモンに集約し、接続状態を$alpha P$から$D$へ削減
+  - Req/Resをリングバッファにバッチ化し、doorbell/CQ処理の固定コストを償却
+  - 到着分散で崩れるバッチをAdaptive Batch Holdで再形成
 
-  #v(0.7em)
-
-  #align(center)[
-    #box(stroke: 1pt, inset: 0.8em, radius: 4pt, fill: rgb("#f0f0f0"))[
-      ただし集約は通信経路に1-hop追加するため、\
-      接続状態削減の利得がその固定オーバーヘッドを上回るかが評価上の焦点
-    ]
-  ]
 ]
 
 // ===== Part 2: 設計 =====
@@ -177,26 +163,14 @@
       - 通知コストをバッチ単位に償却
     ],
     [
-      // TODO: 送信リング・受信リングのペア構成を示す簡略図を作成してここに挿入
-      #align(center)[
-        #box(width: 100%, height: 60%, stroke: 1pt + gray, radius: 4pt, inset: 1em)[
-          #align(center + horizon)[
-            #text(fill: gray)[（図: 送信リング/受信リングのペア構成）]
-          ]
-        ]
-      ]
+      #figure(
+        image("handmade-figures/ringbufrpc.drawio.pdf", width: 100%),
+        caption: [送信リング/受信リングのペア構成],
+      )
     ],
   )
 ]
 
-== フロー制御
-
-#slide[
-  - 送信バッファ進行位置管理で受信バッファ利用量を同期的に制御
-  - 通常時: Req/Resバッチにflow metadataをpiggyback
-  - デッドロック回避: 送信リング満杯時にRDMA READで対向consumed位置を能動取得
-  - 受信側はResponse滞留中もReq処理を継続 → consumed前進で相互待ち解消
-]
 
 == 送信バッファ書き込み調停
 
@@ -225,6 +199,7 @@
 
 #slide[
   === バッチ崩壊の問題
+  - CPUが空転しているにも関わらず性能が低下する現象
   - ノード数増加でリクエスト到着が分散 → 1ループあたり到着数減少
   - 固定コスト（CQポーリング, IPCチェック）の償却が崩れる
   - 小バッチ → ループ高速化 → さらに到着少 → 正のフィードバックで性能低下
@@ -244,17 +219,15 @@
 
 #slide[
   #set text(size: 0.9em)
-  - *FaRM*: RC維持+thread-to-node粗粒化でQP共有 → スレッド単位
-  - *eRPC*: packet I/O（UD相当）でNIC状態依存を排除 → one-sided不可
-  - *ScaleRPC*: connection grouping+virtualized mapping → ノードレベルQP thrashing残存
-  - *Flock*: RC接続多重化+coalescing → スレッド間共有が主眼
-  - *mRPC*: 共有メモリ+サービス集約 → クラウド向け、接続削減は非主眼
+  - *FaRM, eRPC, Flock*: スレッド単位の最適化 → 複数プロセスの集約には適用できない
+  - *ScaleRPC*: クライアント側負荷が高く、少数サーバ・多数クライアントモデル向け
+  - *mRPC*: 共有メモリ+サービス集約で最も近いが、非HPC向けで通信特性が異なる
 
-  #v(0.3em)
+  #v(0.5em)
 
   #align(center)[
     #box(stroke: 0.5pt, inset: 0.6em, radius: 4pt)[
-      本研究: ノード内プロセス群をデーモンへ集約 → アーキテクチャレベルで状態量抑制
+      本研究: 複数プロセスの通信をデーモンへ集約し、通信資源の負荷を削減
     ]
   ]
 ]
